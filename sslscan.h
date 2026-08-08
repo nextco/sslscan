@@ -211,6 +211,13 @@ struct sslCheckOptions
     unsigned int tls13_supported;
 };
 
+struct azureTLSRestriction
+{
+    unsigned int restricted;
+    char http_status[8];
+    char error_code[64];
+};
+
 // store renegotiation test data
 struct renegotiationOutput
 {
@@ -319,6 +326,8 @@ void bs_set_ushort(bs *b, size_t offset, unsigned short length);
 int bs_read_socket(bs *b, int s, size_t num_bytes);
 unsigned int checkIfTLSVersionIsSupported(struct sslCheckOptions *options, unsigned int tls_version);
 unsigned int checkIfTLSVersionIsSupported_Backup(struct sslCheckOptions *options, unsigned int tls_version);
+void checkIfAzureRejectsTLSVersion(struct sslCheckOptions *options, unsigned int tls_version, struct azureTLSRestriction *restriction);
+const char *getTLSEnabledStatus(const struct azureTLSRestriction *restriction, const char *colour);
 SSL_CTX *CTX_new(const SSL_METHOD *method);
 int fileExists(char *);
 void findMissingCiphers();

@@ -59,6 +59,9 @@
     // There is no snprintf(), but _snprintf() instead.
     #define snprintf _snprintf
 
+    // Nor strcasecmp(), but _stricmp() instead.
+    #define strcasecmp _stricmp
+
     // Calling close() on a socket descriptor instead of closesocket() causes
     // a crash!
     #define close closesocket
@@ -3467,8 +3470,11 @@ int testHost(struct sslCheckOptions *options)
     /* Test if TLSv1.0 through TLSv1.3 is supported.  This allows us to skip unnecessary tests later.  Print status of each protocol when verbose flag is set. */
     if ((options->sslVersion == ssl_all) || (options->sslVersion == tls_all) || (options->sslVersion == tls_v10)) {
       if ((options->tls10_supported = checkIfTLSVersionIsSupported(options, TLSv1_0))) {
-	printf("TLSv1.0   %senabled%s\n", COL_YELLOW, RESET);
-	printf_xml("  <protocol type=\"tls\" version=\"1.0\" enabled=\"1\" />\n");
+	struct azureTLSRestriction restriction;
+
+	checkIfAzureRejectsTLSVersion(options, TLSv1_0, &restriction);
+	printf("TLSv1.0   %s\n", getTLSEnabledStatus(&restriction, COL_YELLOW));
+	printf_xml("  <protocol type=\"tls\" version=\"1.0\" enabled=\"1\"%s />\n", restriction.restricted ? " azureAccountBlocked=\"1\"" : "");
       } else {
 	printf("TLSv1.0   %sdisabled%s\n", COL_GREEN, RESET);
 	printf_xml("  <protocol type=\"tls\" version=\"1.0\" enabled=\"0\" />\n");
@@ -3477,8 +3483,11 @@ int testHost(struct sslCheckOptions *options)
 
     if ((options->sslVersion == ssl_all) || (options->sslVersion == tls_all) || (options->sslVersion == tls_v11)) {
       if ((options->tls11_supported = checkIfTLSVersionIsSupported(options, TLSv1_1))) {
-	printf("TLSv1.1   %senabled%s\n", COL_YELLOW, RESET);
-	printf_xml("  <protocol type=\"tls\" version=\"1.1\" enabled=\"1\" />\n");
+	struct azureTLSRestriction restriction;
+
+	checkIfAzureRejectsTLSVersion(options, TLSv1_1, &restriction);
+	printf("TLSv1.1   %s\n", getTLSEnabledStatus(&restriction, COL_YELLOW));
+	printf_xml("  <protocol type=\"tls\" version=\"1.1\" enabled=\"1\"%s />\n", restriction.restricted ? " azureAccountBlocked=\"1\"" : "");
       } else {
 	printf("TLSv1.1   %sdisabled%s\n", COL_GREEN, RESET);
 	printf_xml("  <protocol type=\"tls\" version=\"1.1\" enabled=\"0\" />\n");
@@ -3487,8 +3496,11 @@ int testHost(struct sslCheckOptions *options)
 
     if ((options->sslVersion == ssl_all) || (options->sslVersion == tls_all) || (options->sslVersion == tls_v12)) {
       if ((options->tls12_supported = checkIfTLSVersionIsSupported(options, TLSv1_2))) {
-	printf("TLSv1.2   enabled\n");
-	printf_xml("  <protocol type=\"tls\" version=\"1.2\" enabled=\"1\" />\n");
+	struct azureTLSRestriction restriction;
+
+	checkIfAzureRejectsTLSVersion(options, TLSv1_2, &restriction);
+	printf("TLSv1.2   %s\n", getTLSEnabledStatus(&restriction, ""));
+	printf_xml("  <protocol type=\"tls\" version=\"1.2\" enabled=\"1\"%s />\n", restriction.restricted ? " azureAccountBlocked=\"1\"" : "");
       } else {
 	printf("TLSv1.2   disabled\n");
 	printf_xml("  <protocol type=\"tls\" version=\"1.2\" enabled=\"0\" />\n");
@@ -5107,6 +5119,165 @@ unsigned int checkIfTLSVersionIsSupported_Backup(struct sslCheckOptions *options
   FREE_CTX(options->ctx);
   FREE_SSL(ssl);
   return ret;
+}
+
+static const struct {
+  const char *service;
+  const char *path;
+} azure_storage_services[] = {
+  { "blob",  "/?comp=list" },
+  { "file",  "/?comp=list" },
+  { "queue", "/?comp=list" },
+  { "table", "/Tables" },
+};
+
+static const char *getAzureStorageProbePath(const struct sslCheckOptions *options) {
+  const char *suffix = ".core.windows.net", *name = options->sniname, *service = NULL, *end = NULL;
+  size_t name_len = strlen(name), suffix_len = strlen(suffix), service_len = 0, i = 0;
+
+  if (options->port != 443)
+    return NULL;
+
+  if (options->starttls_ftp || options->starttls_imap || options->starttls_irc ||
+      options->starttls_ldap || options->starttls_pop3 || options->starttls_smtp ||
+      options->starttls_mysql || options->starttls_xmpp || options->starttls_psql || options->rdp)
+    return NULL;
+
+  if ((name_len <= suffix_len) || (strcasecmp(name + (name_len - suffix_len), suffix) != 0))
+    return NULL;
+
+  end = name + (name_len - suffix_len);
+  for (service = end; (service > name) && (service[-1] != '.'); service--)
+    ;
+
+  if (service == name)
+    return NULL;
+
+  service_len = (size_t)(end - service);
+
+  for (i = 0; i < sizeof(azure_storage_services) / sizeof(azure_storage_services[0]); i++) {
+    if ((strlen(azure_storage_services[i].service) == service_len) &&
+        (strncasecmp(service, azure_storage_services[i].service, service_len) == 0))
+      return azure_storage_services[i].path;
+  }
+
+  return NULL;
+}
+
+/* Azure enforces an account's minimum TLS version at the application layer instead of the TLS
+ * listener, so the shared *.windows.net front-ends keep accepting TLSv1.0 and TLSv1.1 handshakes on
+ * behalf of the accounts that still allow them.  Handshakes with this version, then sends a request
+ * that reaches the account itself, and records how the account answered. */
+void checkIfAzureRejectsTLSVersion(struct sslCheckOptions *options, unsigned int tls_version, struct azureTLSRestriction *restriction) {
+  const char *header_name = "\r\nx-ms-error-code: ", *header = NULL, *path = NULL;
+  int socketDescriptor = -1, version = -1, n = 0;
+  const SSL_METHOD *sslMethod = NULL;
+  SSL_CTX *ctx = NULL;
+  SSL *ssl = NULL;
+  BIO *bio = NULL;
+  size_t received = 0;
+  char request[1024], response[8192];
+
+  memset(restriction, 0, sizeof(struct azureTLSRestriction));
+
+  path = getAzureStorageProbePath(options);
+  if (path == NULL)
+    return;
+
+  if (tls_version == TLSv1_0) {
+    sslMethod = TLSv1_client_method();
+    version = TLS1_VERSION;
+  } else if (tls_version == TLSv1_1) {
+    sslMethod = TLSv1_1_client_method();
+    version = TLS1_1_VERSION;
+  } else if (tls_version == TLSv1_2) {
+    sslMethod = TLSv1_2_client_method();
+    version = TLS1_2_VERSION;
+  } else if (tls_version == TLSv1_3) {
+    sslMethod = TLSv1_3_client_method();
+    version = TLS1_3_VERSION;
+  } else
+    return;
+
+  printf_verbose("Sending an HTTP request over %s to check the Azure account's minimum TLS version.\n", getPrintableTLSName(tls_version));
+
+  socketDescriptor = tcpConnect(options);
+  if (socketDescriptor == 0) {
+    socketDescriptor = -1;
+    goto done;
+  }
+
+  ctx = new_CTX(sslMethod);
+  if (ctx == NULL)
+    goto done;
+
+  /* Pin the connection to this exact TLS version. */
+  if (!SSL_CTX_set_min_proto_version(ctx, version) || !SSL_CTX_set_max_proto_version(ctx, version))
+    goto done;
+
+  SSL_CTX_set_cipher_list(ctx, CIPHERSUITE_LIST_ALL);
+
+  ssl = new_SSL(ctx);
+  if (ssl == NULL)
+    goto done;
+
+  if (!SSL_set_tlsext_host_name(ssl, options->sniname))
+    goto done;
+
+  bio = BIO_new_socket(socketDescriptor, BIO_NOCLOSE);
+  if (bio == NULL)
+    goto done;
+
+  SSL_set_bio(ssl, bio, bio);
+
+  if (SSL_connect(ssl) != 1) {
+    printf_verbose("%s: handshake failed.\n", __func__);
+    goto done;
+  }
+
+  /* A service-level request, so the answer comes from the account and not just the front-end.  An
+   * account that permits this version answers 403 AuthorizationFailure, since we're unauthenticated. */
+  snprintf(request, sizeof(request), "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:150.0)\r\nx-ms-version: 2021-08-06\r\nConnection: close\r\n\r\n", path, options->sniname);
+
+  if (SSL_write(ssl, request, (int)strlen(request)) <= 0)
+    goto done;
+
+  /* Only the response headers are needed. */
+  while ((received < (sizeof(response) - 1)) && (memmem(response, received, "\r\n\r\n", 4) == NULL)) {
+    n = SSL_read(ssl, response + received, (int)(sizeof(response) - 1 - received));
+    if (n <= 0)
+      break;
+
+    received += (size_t)n;
+  }
+  response[received] = 0;
+
+  sscanf(response, "HTTP/%*u.%*u %7[0-9]", restriction->http_status);
+
+  header = strstr(response, header_name);
+  if (header != NULL)
+    sscanf(header + strlen(header_name), "%63[^\r]", restriction->error_code);
+
+  restriction->restricted = (strcmp(restriction->error_code, "TlsVersionNotPermitted") == 0);
+
+ done:
+  FREE_SSL(ssl);  /* Frees the BIO too. */
+  FREE_CTX(ctx);
+  CLOSE(socketDescriptor);
+}
+
+/* Returns the status to print for a protocol version that the server handshakes with.  The
+ * handshake is all there is to report unless the Azure account behind it refuses to serve requests
+ * over that version, which makes it unusable in practice. */
+const char *getTLSEnabledStatus(const struct azureTLSRestriction *restriction, const char *colour) {
+  static char status[256];
+
+  if (restriction->restricted)
+    snprintf(status, sizeof(status), "%srestricted%s  Azure Storage enforces the account's minimum TLS version at the application layer - HTTP %s %s", COL_GREEN, RESET, restriction->http_status, restriction->error_code);
+  else
+    snprintf(status, sizeof(status), "%senabled%s", colour, colour[0] ? RESET : "");
+
+  return status;
 }
 
 /* Given a TLSv1_? constant, return its printable string representation. */
